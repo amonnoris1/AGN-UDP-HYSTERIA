@@ -5,7 +5,7 @@
 # (c) 2023 Khaled AGN
 #
 
-set -e
+# set -e removed: apt lock or transient failures should not abort the entire install
 
 # Domain Name
 DOMAIN="vpn.khaledagn.me"
@@ -645,7 +645,18 @@ perform_install_manager_script() {
     local _symlink_path="/usr/local/bin/agnudp"
     
     echo "Downloading manager script..."
-    curl -o "$_manager_script" "https://github.com/amonnoris1/AGN-UDP-HYSTERIA/raw/main/agnudp_manager.sh"
+    curl -o "$_manager_script" "https://raw.githubusercontent.com/amonnoris1/AGN-UDP-HYSTERIA/main/agnudp_manager.sh"
+    # Fallback: if download failed, try copying local copy
+    if [[ ! -s "$_manager_script" ]]; then
+        local _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        if [[ -f "$_script_dir/agnudp_manager.sh" ]]; then
+            echo "Download failed, using local copy..."
+            cp "$_script_dir/agnudp_manager.sh" "$_manager_script"
+        elif [[ -f "$HOME/agnudp_manager.sh" ]]; then
+            echo "Download failed, using ~/agnudp_manager.sh ..."
+            cp "$HOME/agnudp_manager.sh" "$_manager_script"
+        fi
+    fi
     chmod +x "$_manager_script"
     
     echo "Creating symbolic link to run the manager script using 'agnudp' command..."
@@ -779,16 +790,33 @@ setup_ssl() {
     openssl x509 -req -extfile <(printf "subjectAltName=DNS:$DOMAIN,DNS:$DOMAIN") -days 3650 -in /etc/hysteria/hysteria.server.csr -CA /etc/hysteria/hysteria.ca.crt -CAkey /etc/hysteria/hysteria.ca.key -CAcreateserial -out /etc/hysteria/hysteria.server.crt
 }
 
+wait_for_apt_lock() {
+    local _max_wait=60
+    local _waited=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/cache/debconf/config.dat >/dev/null 2>&1; do
+        if [[ $_waited -eq 0 ]]; then
+            echo "Waiting for other apt/dpkg processes to finish..."
+        fi
+        sleep 2
+        _waited=$((_waited + 2))
+        if [[ $_waited -ge $_max_wait ]]; then
+            echo "Warning: apt lock still held after ${_max_wait}s, proceeding anyway..."
+            break
+        fi
+    done
+}
+
 start_services() {
     echo "Starting AGN-UDP"
-    apt update
+    wait_for_apt_lock
+    apt update || true
     sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v4 boolean true"
     sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v6 boolean true"
-    apt -y install iptables-persistent
-    iptables -t nat -A PREROUTING -i $(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1) -p udp --dport 10000:65000 -j DNAT --to-destination $UDP_PORT
-    ip6tables -t nat -A PREROUTING -i $(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1) -p udp --dport 10000:65000 -j DNAT --to-destination $UDP_PORT
-    sysctl net.ipv4.conf.all.rp_filter=0
-    sysctl net.ipv4.conf.$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1).rp_filter=0
+    apt -y install iptables-persistent || echo "Warning: iptables-persistent install failed, continuing..."
+    iptables -t nat -A PREROUTING -i $(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1) -p udp --dport 10000:65000 -j DNAT --to-destination $UDP_PORT || true
+    ip6tables -t nat -A PREROUTING -i $(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1) -p udp --dport 10000:65000 -j DNAT --to-destination $UDP_PORT || true
+    sysctl net.ipv4.conf.all.rp_filter=0 || true
+    sysctl net.ipv4.conf.$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1).rp_filter=0 || true
     echo "net.ipv4.ip_forward = 1
     net.ipv4.conf.all.rp_filter=0
     net.ipv4.conf.$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1).rp_filter=0" > /etc/sysctl.conf
